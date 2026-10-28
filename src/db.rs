@@ -127,6 +127,13 @@ pub fn open(path: &str) -> Result<Connection> {
              expires_at TEXT NOT NULL
          );
 
+         CREATE TABLE IF NOT EXISTS oauth_states (
+             state      TEXT PRIMARY KEY,
+             verifier   TEXT NOT NULL,
+             nonce      TEXT NOT NULL,
+             created_at TEXT NOT NULL DEFAULT (datetime('now'))
+         );
+
          CREATE TABLE IF NOT EXISTS tickets (
              id                 INTEGER PRIMARY KEY,
              token              TEXT NOT NULL UNIQUE,
@@ -245,6 +252,20 @@ fn row_to_user(r: &rusqlite::Row) -> Result<User> {
     })
 }
 
+pub fn user_by_username(conn: &Connection, username: &str) -> Result<Option<User>> {
+    conn.query_row(
+        "SELECT id, username, display_name, is_admin, active, role, location FROM users
+         WHERE lower(username) = lower(?1)",
+        [username],
+        row_to_user,
+    )
+    .optional()
+}
+
+pub fn user_role(conn: &Connection, id: i64) -> Result<String> {
+    conn.query_row("SELECT role FROM users WHERE id = ?1", [id], |r| r.get(0))
+}
+
 pub fn list_users(conn: &Connection) -> Result<Vec<User>> {
     let mut stmt = conn.prepare(
         "SELECT id, username, display_name, is_admin, active, role, location FROM users
@@ -294,6 +315,31 @@ pub fn session_user(conn: &Connection, token: &str) -> Result<Option<User>> {
 pub fn delete_session(conn: &Connection, token: &str) -> Result<()> {
     conn.execute("DELETE FROM sessions WHERE token = ?1", [token])?;
     Ok(())
+}
+
+// ---------- Connexion via fournisseur d'identité ----------
+
+pub fn save_oauth_state(conn: &Connection, state: &str, verifier: &str, nonce: &str) -> Result<()> {
+    conn.execute("DELETE FROM oauth_states WHERE created_at < datetime('now', '-10 minutes')", [])?;
+    conn.execute(
+        "INSERT INTO oauth_states (state, verifier, nonce) VALUES (?1, ?2, ?3)",
+        params![state, verifier, nonce],
+    )?;
+    Ok(())
+}
+
+/// Récupère et supprime (usage unique) un état de connexion de moins de 10 minutes.
+pub fn take_oauth_state(conn: &Connection, state: &str) -> Result<Option<(String, String)>> {
+    let row = conn
+        .query_row(
+            "SELECT verifier, nonce FROM oauth_states
+             WHERE state = ?1 AND created_at >= datetime('now', '-10 minutes')",
+            [state],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    conn.execute("DELETE FROM oauth_states WHERE state = ?1", [state])?;
+    Ok(row)
 }
 
 // ---------- Tickets ----------

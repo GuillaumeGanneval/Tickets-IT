@@ -43,10 +43,44 @@ un mot de passe est généré et affiché dans la console).
 | `TICKETING_ALLOWED_DOMAIN` | `sias.fr`         | Seul domaine e-mail autorisé à créer un compte |
 | `ADMIN_PASSWORD`     | (généré)                | Mot de passe du compte admin initial         |
 
+## Connexion Microsoft 365 / Google Workspace (optionnelle)
+
+Désactivée par défaut : sans variables `OIDC_*`, les demandeurs s'inscrivent avec un mot de passe.
+Une fois activée :
+- les demandeurs cliquent sur « Se connecter avec Microsoft 365 » (ou Google) ; leur compte est créé
+  automatiquement à la première connexion, l'inscription par mot de passe est désactivée ;
+- seuls les comptes du domaine `TICKETING_ALLOWED_DOMAIN` sont acceptés
+  (pour Google, le domaine Workspace `hd` est aussi vérifié) ;
+- les techniciens gardent leur compte local ; un technicien dont l'identifiant est son adresse
+  (ex. `paul@sias.fr`) peut aussi se connecter via le fournisseur.
+
+| Variable             | Rôle                                                                  |
+|----------------------|-----------------------------------------------------------------------|
+| `OIDC_PROVIDER`      | `microsoft`, `google` ou `generic`                                    |
+| `OIDC_TENANT`        | Microsoft uniquement : ID du locataire ou domaine (`sias.fr`)         |
+| `OIDC_ISSUER`        | `generic` uniquement : URL de l'émetteur OIDC                         |
+| `OIDC_CLIENT_ID`     | Identifiant de l'application déclarée chez le fournisseur             |
+| `OIDC_CLIENT_SECRET` | Secret de l'application                                               |
+
+URL de redirection à déclarer chez le fournisseur : `<TICKETING_BASE_URL>/auth/callback`.
+
+**Microsoft (Entra ID)** : *Inscriptions d'applications → Nouvelle inscription*, type de compte
+« Comptes dans cet annuaire uniquement », URI de redirection *Web* ci-dessus, puis créer un secret
+client dans *Certificats et secrets*.
+
+**Google** : console Google Cloud → *API et services → Identifiants → ID client OAuth* (type
+« Application Web »), écran de consentement de type « Interne ».
+
+> Déclarer l'application chez Microsoft ou Google est visible par les administrateurs de
+> l'organisation : pour tester sans toucher l'annuaire de l'entreprise, utilisez un locataire de
+> test séparé (et `TICKETING_ALLOWED_DOMAIN=votretest.onmicrosoft.com`).
+
 ## Sécurité / mise en production
-- Mots de passe hachés avec Argon2id, sessions par cookie `HttpOnly; SameSite=Strict` (12 h).
-- L'adresse e-mail n'est pas vérifiée à l'inscription (pas d'envoi d'e-mail) : le contrôle porte
-  uniquement sur le domaine saisi.
+- Mots de passe hachés avec Argon2id, sessions par cookie `HttpOnly; SameSite=Lax` (12 h).
+- Connexion OIDC : flux « authorization code » avec PKCE, état anti-CSRF à usage unique, vérification
+  de l'émetteur, de l'audience, de l'expiration et du nonce du jeton d'identité.
+- Sans fournisseur d'identité, l'adresse e-mail n'est pas vérifiée à l'inscription (pas d'envoi
+  d'e-mail) : le contrôle porte uniquement sur le domaine saisi.
 - Toutes les données affichées sont échappées (pas d'injection HTML).
 - Placez l'application derrière un reverse proxy HTTPS (nginx, Caddy…) et sauvegardez `tickets.db`.
 

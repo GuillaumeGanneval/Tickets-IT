@@ -113,7 +113,6 @@ pub fn layout(title: &str, user: Option<&User>, body: &str) -> String {
             )
         }
         None => r#"<span class="spacer"></span>
-                   <a href="/inscription">Créer un compte</a>
                    <a href="/login">Connexion</a>"#
             .to_string(),
     };
@@ -158,16 +157,22 @@ fn flash(msg: Option<&str>, error: bool) -> String {
 
 // ---------- Pages publiques ----------
 
-pub fn home_page(domain: &str) -> String {
+/// `sso` : libellé du bouton du fournisseur d'identité, si la connexion par fournisseur est active.
+pub fn home_page(domain: &str, sso: Option<&str>) -> String {
+    let buttons = match sso {
+        Some(label) => format!(r#"<a class="btn" href="/auth/login">{}</a>"#, esc(label)),
+        None => r#"<a class="btn" href="/login">Se connecter</a>
+  <a class="btn" style="background:#64748b" href="/inscription">Créer un compte</a>"#
+            .to_string(),
+    };
     let body = format!(
         r#"<div class="card" style="max-width:640px;margin:40px auto;text-align:center">
 <h1>Support informatique</h1>
 <p>Toutes les demandes informatiques passent par cet outil : pannes, accès, matériel, logiciels…</p>
 <p class="muted">Connectez-vous pour créer une demande et suivre toutes vos demandes au même endroit.
-Le compte est réservé aux adresses <b>@{}</b>.</p>
+Accès réservé aux comptes <b>@{}</b>.</p>
 <p style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
-  <a class="btn" href="/login">Se connecter</a>
-  <a class="btn" style="background:#64748b" href="/inscription">Créer un compte</a>
+  {buttons}
 </p></div>"#,
         esc(domain)
     );
@@ -374,18 +379,30 @@ Si le problème persiste, répondez ci-dessus : le ticket sera rouvert. Sinon vo
     layout(&format!("Ticket #{}", t.id), viewer, &body)
 }
 
-pub fn login_page(error: Option<&str>) -> String {
-    let body = format!(
-        r#"<div class="card" style="max-width:420px;margin:40px auto">
-<h1>Connexion</h1>{}
-<form method="post" action="/login">
-  <label for="username">E-mail (ou identifiant technicien)</label>
-  <input type="text" id="username" name="username" required autofocus autocomplete="username">
+pub fn login_page(error: Option<&str>, sso: Option<&str>) -> String {
+    let form = r#"<form method="post" action="/login">
+  <label for="username">{LABEL}</label>
+  <input type="text" id="username" name="username" required autocomplete="username">
   <label for="password">Mot de passe</label>
   <input type="password" id="password" name="password" required autocomplete="current-password">
   <p><button type="submit">Se connecter</button></p>
-</form>
-<p class="muted">Pas encore de compte ? <a href="/inscription">Créer un compte</a></p></div>"#,
+</form>"#;
+    let content = match sso {
+        Some(label) => format!(
+            r#"<p><a class="btn" style="display:block;text-align:center;padding:12px" href="/auth/login">{}</a></p>
+<details style="margin-top:20px"><summary class="muted" style="cursor:pointer">Compte local (techniciens)</summary>
+{}</details>"#,
+            esc(label),
+            form.replace("{LABEL}", "Identifiant technicien")
+        ),
+        None => format!(
+            r#"{}<p class="muted">Pas encore de compte ? <a href="/inscription">Créer un compte</a></p>"#,
+            form.replace("{LABEL}", "E-mail (ou identifiant technicien)")
+        ),
+    };
+    let body = format!(
+        r#"<div class="card" style="max-width:420px;margin:40px auto">
+<h1>Connexion</h1>{}{content}</div>"#,
         flash(error, true)
     );
     layout("Connexion", None, &body)

@@ -1,5 +1,6 @@
 mod auth;
 mod db;
+mod oidc;
 mod views;
 
 use std::sync::{Arc, Mutex};
@@ -8,7 +9,7 @@ use axum::{
     Form, Router,
     extract::{Path, Query, State},
     http::{StatusCode, header},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{AppendHeaders, Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use rusqlite::Connection;
@@ -23,6 +24,14 @@ pub struct AppState {
     pub base_url: Arc<String>,
     /// Seules les adresses de ce domaine peuvent créer un compte demandeur.
     pub allowed_domain: Arc<String>,
+    /// Connexion via Microsoft 365 / Google Workspace, si configurée.
+    pub oidc: Option<Arc<oidc::Oidc>>,
+}
+
+impl AppState {
+    fn sso_label(&self) -> Option<&'static str> {
+        self.oidc.as_ref().map(|o| o.label())
+    }
 }
 
 // ---------- Gestion des erreurs ----------
@@ -76,7 +85,7 @@ fn clean(s: &str, max: usize) -> String {
 
 async fn home(State(st): State<AppState>, MaybeUser(user): MaybeUser) -> Response {
     match user {
-        None => Html(views::home_page(&st.allowed_domain)).into_response(),
+        None => Html(views::home_page(&st.allowed_domain, st.sso_label())).into_response(),
         Some(u) if u.is_agent() => Redirect::to("/agent").into_response(),
         Some(u) => Html(views::new_ticket_page(&u, None)).into_response(),
     }
@@ -145,7 +154,8 @@ fn email_allowed(email: &str, domain: &str) -> bool {
 }
 
 async fn register_form(State(st): State<AppState>, MaybeUser(user): MaybeUser) -> Response {
-    if user.is_some() {
+    // Avec un fournisseur d'identité, le compte est créé à la première connexion.
+    if user.is_some() || st.oidc.is_some() {
         return Redirect::to("/").into_response();
     }
     let empty = views::RegisterValues { display_name: "", email: "", location: "" };
@@ -163,6 +173,9 @@ struct RegisterForm {
 }
 
 async fn register(State(st): State<AppState>, Form(f): Form<RegisterForm>) -> AppResult<Response> {
+    if st.oidc.is_some() {
+        return Ok(Redirect::to("/login").into_response());
+    }
     let display_name = clean(&f.display_name, 100);
     let email = clean(&f.email, 150).to_lowercase();
     let location = clean(&f.location, 100);
@@ -256,11 +269,14 @@ async fn public_close(State(st): State<AppState>, Path(token): Path<String>) -> 
 
 // ---------- Authentification ----------
 
-async fn login_form(MaybeUser(user): MaybeUser) -> Response {
+fn home_for(user: &db::User) -> &'static str {
+    if user.is_agent() { "/agent" } else { "/mes-demandes" }
+}
+
+async fn login_form(State(st): State<AppState>, MaybeUser(user): MaybeUser) -> Response {
     match user {
-        Some(u) if u.is_agent() => Redirect::to("/agent").into_response(),
-        Some(_) => Redirect::to("/mes-demandes").into_response(),
-        None => Html(views::login_page(None)).into_response(),
+        Some(u) => Redirect::to(home_for(&u)).into_response(),
+        None => Html(views::login_page(None, st.sso_label())).into_response(),
     }
 }
 
@@ -274,16 +290,18 @@ async fn login(State(st): State<AppState>, Form(f): Form<LoginForm>) -> AppResul
     let creds = db::user_credentials(&st.db.lock().unwrap(), f.username.trim())?;
     let user_id = creds.and_then(|(id, hash)| auth::verify_password(&f.password, &hash).then_some(id));
     let Some(user_id) = user_id else {
-        let page = views::login_page(Some("Identifiant ou mot de passe incorrect."));
+        let page = views::login_page(Some("Identifiant ou mot de passe incorrect."), st.sso_label());
         return Ok((StatusCode::UNAUTHORIZED, Html(page)).into_response());
     };
+    let role = db::user_role(&st.db.lock().unwrap(), user_id)?;
+    // Avec un fournisseur d'identité, les demandeurs passent obligatoirement par lui.
+    if let Some(label) = st.sso_label().filter(|_| role == db::ROLE_REQUESTER) {
+        let msg = format!("Utilisez le bouton « {label} ».");
+        return Ok((StatusCode::UNAUTHORIZED, Html(views::login_page(Some(&msg), Some(label)))).into_response());
+    }
     let token = auth::random_token();
-    let is_agent = {
-        let conn = st.db.lock().unwrap();
-        db::create_session(&conn, &token, user_id)?;
-        db::session_user(&conn, &token)?.is_some_and(|u| u.is_agent())
-    };
-    let target = if is_agent { "/agent" } else { "/mes-demandes" };
+    db::create_session(&st.db.lock().unwrap(), &token, user_id)?;
+    let target = if role == db::ROLE_REQUESTER { "/mes-demandes" } else { "/agent" };
     Ok(([(header::SET_COOKIE, auth::session_cookie(&token))], Redirect::to(target)).into_response())
 }
 
@@ -293,6 +311,96 @@ async fn logout(State(st): State<AppState>, req: axum::extract::Request) -> AppR
         db::delete_session(&st.db.lock().unwrap(), &token)?;
     }
     Ok(([(header::SET_COOKIE, auth::clear_cookie())], Redirect::to("/login")).into_response())
+}
+
+// ---------- Connexion via Microsoft 365 / Google Workspace ----------
+
+async fn sso_start(State(st): State<AppState>) -> AppResult<Response> {
+    let Some(oidc) = st.oidc.clone() else {
+        return Ok(not_found());
+    };
+    let (state, nonce, verifier) = (auth::random_token(), auth::random_token(), auth::random_token());
+    db::save_oauth_state(&st.db.lock().unwrap(), &state, &verifier, &nonce)?;
+    let url = oidc.authorize_url(&state, &nonce, &verifier);
+    Ok(([(header::SET_COOKIE, auth::state_cookie(&state))], Redirect::to(&url)).into_response())
+}
+
+#[derive(Deserialize)]
+struct CallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+fn sso_error(st: &AppState, msg: &str) -> Response {
+    let page = views::login_page(Some(msg), st.sso_label());
+    ([(header::SET_COOKIE, auth::clear_state_cookie())], (StatusCode::UNAUTHORIZED, Html(page))).into_response()
+}
+
+async fn sso_callback(
+    State(st): State<AppState>,
+    Query(q): Query<CallbackQuery>,
+    req: axum::extract::Request,
+) -> AppResult<Response> {
+    let Some(oidc) = st.oidc.clone() else {
+        return Ok(not_found());
+    };
+    if let Some(err) = q.error {
+        eprintln!("Connexion refusée par le fournisseur : {err} {}", q.error_description.unwrap_or_default());
+        return Ok(sso_error(&st, "Connexion annulée ou refusée."));
+    }
+    let (parts, _) = req.into_parts();
+    let (Some(code), Some(state)) = (q.code, q.state) else {
+        return Ok(sso_error(&st, "Réponse de connexion incomplète."));
+    };
+    // L'état doit correspondre au cookie posé par ce navigateur (protection CSRF).
+    if auth::cookie_value(&parts, auth::STATE_COOKIE).as_deref() != Some(state.as_str()) {
+        return Ok(sso_error(&st, "Session de connexion expirée, veuillez réessayer."));
+    }
+    let Some((verifier, nonce)) = db::take_oauth_state(&st.db.lock().unwrap(), &state)? else {
+        return Ok(sso_error(&st, "Session de connexion expirée, veuillez réessayer."));
+    };
+
+    let identity = match oidc.exchange(&code, &verifier, &nonce).await {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("Échec de connexion via le fournisseur : {e}");
+            let msg = if e.starts_with("seules les adresses") || e.starts_with("compte Google") {
+                format!("Accès réservé aux comptes @{}.", st.allowed_domain)
+            } else {
+                "La connexion a échoué. Réessayez ou contactez le support informatique.".to_string()
+            };
+            return Ok(sso_error(&st, &msg));
+        }
+    };
+
+    let token = auth::random_token();
+    let target = {
+        let conn = st.db.lock().unwrap();
+        let user_id = match db::user_by_username(&conn, &identity.email)? {
+            Some(u) if !u.active => {
+                drop(conn);
+                return Ok(sso_error(&st, "Votre compte a été désactivé. Contactez le support informatique."));
+            }
+            Some(u) => u.id,
+            None => {
+                // Première connexion : création du compte demandeur, sans mot de passe local.
+                let id = db::create_requester(&conn, &identity.email, &identity.name, "", "!sso")?;
+                db::link_tickets_by_email(&conn, id, &identity.email)?;
+                println!("Nouveau compte demandeur (fournisseur d'identité) : {}", identity.email);
+                id
+            }
+        };
+        db::create_session(&conn, &token, user_id)?;
+        if db::user_role(&conn, user_id)? == db::ROLE_REQUESTER { "/mes-demandes" } else { "/agent" }
+    };
+    // AppendHeaders : deux en-têtes Set-Cookie (un tableau simple écraserait le premier).
+    let cookies = AppendHeaders([
+        (header::SET_COOKIE, auth::session_cookie(&token)),
+        (header::SET_COOKIE, auth::clear_state_cookie()),
+    ]);
+    Ok((cookies, Redirect::to(target)).into_response())
 }
 
 // ---------- Côté technicien ----------
@@ -580,6 +688,8 @@ pub fn app(state: AppState) -> Router {
         .route("/suivi/{token}/commentaire", post(public_comment))
         .route("/suivi/{token}/fermer", post(public_close))
         .route("/login", get(login_form).post(login))
+        .route("/auth/login", get(sso_start))
+        .route("/auth/callback", get(sso_callback))
         .route("/logout", post(logout))
         .route("/agent", get(dashboard))
         .route("/agent/tickets/{id}", get(agent_ticket))
@@ -603,10 +713,20 @@ async fn main() {
     let conn = db::open(&db_path).expect("ouverture de la base de données impossible");
     bootstrap_admin(&conn).expect("création du compte administrateur impossible");
 
+    let base_url = base_url.trim_end_matches('/').to_string();
+    let oidc = oidc::Oidc::from_env(&base_url, &allowed_domain)
+        .await
+        .unwrap_or_else(|e| panic!("configuration de la connexion par fournisseur invalide : {e}"));
+    match &oidc {
+        Some(o) => println!("Connexion par fournisseur d'identité active (URL de retour : {})", o.redirect_uri()),
+        None => println!("Connexion par fournisseur d'identité désactivée (inscription par mot de passe)"),
+    }
+
     let state = AppState {
         db: Arc::new(Mutex::new(conn)),
-        base_url: Arc::new(base_url.trim_end_matches('/').to_string()),
+        base_url: Arc::new(base_url),
         allowed_domain: Arc::new(allowed_domain),
+        oidc: oidc.map(Arc::new),
     };
 
     let listener = tokio::net::TcpListener::bind(&addr)

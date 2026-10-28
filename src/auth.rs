@@ -11,6 +11,7 @@ use axum::{
 use crate::{AppState, db};
 
 pub const SESSION_COOKIE: &str = "ticketing_session";
+pub const STATE_COOKIE: &str = "ticketing_oidc_state";
 
 pub fn hash_password(password: &str) -> String {
     Argon2::default()
@@ -33,14 +34,29 @@ pub fn random_token() -> String {
 }
 
 pub fn session_cookie(token: &str) -> String {
-    format!("{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200")
+    format!("{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200")
 }
 
 pub fn clear_cookie() -> String {
-    format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+    format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+}
+
+// SameSite=Lax (et non Strict) : le retour depuis le fournisseur d'identité est une
+// navigation venant d'un autre site, qui doit pouvoir lire/poser ces cookies.
+// Toutes les actions qui modifient des données sont en POST, que Lax protège.
+pub fn state_cookie(state: &str) -> String {
+    format!("{STATE_COOKIE}={state}; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=600")
+}
+
+pub fn clear_state_cookie() -> String {
+    format!("{STATE_COOKIE}=; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=0")
 }
 
 pub fn cookie_token(parts: &Parts) -> Option<String> {
+    cookie_value(parts, SESSION_COOKIE)
+}
+
+pub fn cookie_value(parts: &Parts, name: &str) -> Option<String> {
     parts
         .headers
         .get_all(header::COOKIE)
@@ -48,7 +64,7 @@ pub fn cookie_token(parts: &Parts) -> Option<String> {
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|c| c.trim().split_once('='))
-        .find(|(k, _)| *k == SESSION_COOKIE)
+        .find(|(k, _)| *k == name)
         .map(|(_, v)| v.to_string())
 }
 
