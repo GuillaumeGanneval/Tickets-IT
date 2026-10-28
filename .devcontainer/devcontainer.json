@@ -1,0 +1,15 @@
+{
+  "name": "Tickets-IT (Rust)",
+  "image": "mcr.microsoft.com/devcontainers/rust:1",
+  "forwardPorts": [8080],
+  "portsAttributes": {
+    "8080": { "label": "Support IT", "onAutoForward": "openBrowser" }
+  },
+  "containerEnv": {
+    "ADMIN_PASSWORD": "test1234"
+  },
+  "postCreateCommand": "cargo build",
+  "customizations": {
+    "vscode": { "extensions": ["rust-lang.rust-analyzer"] }
+  }
+}

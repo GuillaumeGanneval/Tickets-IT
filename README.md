@@ -42,3 +42,14 @@ un mot de passe est généré et affiché dans la console).
 - Mots de passe hachés avec Argon2id, sessions par cookie `HttpOnly; SameSite=Strict` (12 h).
 - Toutes les données affichées sont échappées (pas d'injection HTML).
 - Placez l'application derrière un reverse proxy HTTPS (nginx, Caddy…) et sauvegardez `tickets.db`.
+
+## Tester dans GitHub Codespaces
+
+Bouton **Code → Codespaces → Create codespace**, attendre la fin de la préparation, puis :
+
+```bash
+cargo run
+```
+
+Ouvrir le port 8080 proposé, et se connecter sur `/login` avec `admin` / `test1234`
+(mot de passe de test défini dans `.devcontainer/devcontainer.json`, uniquement pour Codespaces).
