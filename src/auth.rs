@@ -52,21 +52,54 @@ pub fn cookie_token(parts: &Parts) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
+/// Utilisateur connecté, quel que soit son rôle (ou personne).
+pub struct MaybeUser(pub Option<db::User>);
+
 /// Technicien connecté. Redirige vers /login sinon.
 pub struct Agent(pub db::User);
 
 /// Administrateur connecté.
 pub struct Admin(pub db::User);
 
+/// Demandeur connecté. Redirige vers /login sinon.
+pub struct Requester(pub db::User);
+
+impl FromRequestParts<AppState> for MaybeUser {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        let Some(token) = cookie_token(parts) else {
+            return Ok(MaybeUser(None));
+        };
+        let conn = state.db.lock().unwrap();
+        Ok(MaybeUser(db::session_user(&conn, &token).ok().flatten()))
+    }
+}
+
+fn to_login() -> Response {
+    Redirect::to("/login").into_response()
+}
+
 impl FromRequestParts<AppState> for Agent {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
-        let token = cookie_token(parts).ok_or_else(|| Redirect::to("/login").into_response())?;
-        let conn = state.db.lock().unwrap();
-        match db::session_user(&conn, &token) {
-            Ok(Some(u)) => Ok(Agent(u)),
-            _ => Err(Redirect::to("/login").into_response()),
+        match MaybeUser::from_request_parts(parts, state).await {
+            Ok(MaybeUser(Some(u))) if u.is_agent() => Ok(Agent(u)),
+            Ok(MaybeUser(Some(_))) => Err(Redirect::to("/mes-demandes").into_response()),
+            _ => Err(to_login()),
+        }
+    }
+}
+
+impl FromRequestParts<AppState> for Requester {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        match MaybeUser::from_request_parts(parts, state).await {
+            Ok(MaybeUser(Some(u))) if !u.is_agent() => Ok(Requester(u)),
+            Ok(MaybeUser(Some(_))) => Err(Redirect::to("/agent").into_response()),
+            _ => Err(to_login()),
         }
     }
 }

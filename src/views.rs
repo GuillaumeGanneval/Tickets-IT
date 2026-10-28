@@ -88,9 +88,17 @@ code.link { display:block; padding:10px; background:#f1f5f9; border-radius:6px; 
 
 pub fn layout(title: &str, user: Option<&User>, body: &str) -> String {
     let nav = match user {
+        Some(u) if !u.is_agent() => format!(
+            r#"<a href="/">Nouvelle demande</a>
+               <a href="/mes-demandes">Mes demandes</a>
+               <span class="spacer"></span>
+               <span class="muted" style="color:#94a3b8">{}</span>
+               <form method="post" action="/logout"><button>Déconnexion</button></form>"#,
+            esc(&u.display_name)
+        ),
         Some(u) => {
             let admin = if u.is_admin {
-                r#"<a href="/agent/utilisateurs">Utilisateurs</a>"#
+                r#"<a href="/agent/utilisateurs">Comptes</a>"#
             } else {
                 ""
             };
@@ -104,9 +112,9 @@ pub fn layout(title: &str, user: Option<&User>, body: &str) -> String {
                 esc(&u.display_name)
             )
         }
-        None => r#"<a href="/">Nouvelle demande</a>
-                   <span class="spacer"></span>
-                   <a href="/login">Espace technicien</a>"#
+        None => r#"<span class="spacer"></span>
+                   <a href="/inscription">Créer un compte</a>
+                   <a href="/login">Connexion</a>"#
             .to_string(),
     };
     format!(
@@ -150,21 +158,70 @@ fn flash(msg: Option<&str>, error: bool) -> String {
 
 // ---------- Pages publiques ----------
 
-pub fn new_ticket_page(error: Option<&str>) -> String {
+pub fn home_page(domain: &str) -> String {
+    let body = format!(
+        r#"<div class="card" style="max-width:640px;margin:40px auto;text-align:center">
+<h1>Support informatique</h1>
+<p>Toutes les demandes informatiques passent par cet outil : pannes, accès, matériel, logiciels…</p>
+<p class="muted">Connectez-vous pour créer une demande et suivre toutes vos demandes au même endroit.
+Le compte est réservé aux adresses <b>@{}</b>.</p>
+<p style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
+  <a class="btn" href="/login">Se connecter</a>
+  <a class="btn" style="background:#64748b" href="/inscription">Créer un compte</a>
+</p></div>"#,
+        esc(domain)
+    );
+    layout("Accueil", None, &body)
+}
+
+pub struct RegisterValues<'a> {
+    pub display_name: &'a str,
+    pub email: &'a str,
+    pub location: &'a str,
+}
+
+pub fn register_page(domain: &str, v: &RegisterValues, error: Option<&str>) -> String {
+    let body = format!(
+        r#"<div class="card" style="max-width:520px;margin:40px auto">
+<h1>Créer un compte</h1>{flash}
+<p class="muted">Réservé aux adresses e-mail professionnelles <b>@{domain}</b>.</p>
+<form method="post" action="/inscription">
+  <label for="display_name">Nom et prénom</label>
+  <input type="text" id="display_name" name="display_name" required maxlength="100" value="{name}">
+  <label for="email">E-mail professionnel</label>
+  <input type="email" id="email" name="email" required maxlength="150" value="{email}"
+         placeholder="prenom.nom@{domain}" autocomplete="username">
+  <label for="location">Service / Bureau</label>
+  <input type="text" id="location" name="location" maxlength="100" value="{loc}">
+  <label for="password">Mot de passe (8 caractères min.)</label>
+  <input type="password" id="password" name="password" required minlength="8" autocomplete="new-password">
+  <label for="password2">Confirmer le mot de passe</label>
+  <input type="password" id="password2" name="password2" required minlength="8" autocomplete="new-password">
+  <p><button type="submit">Créer mon compte</button></p>
+</form>
+<p class="muted">Déjà un compte ? <a href="/login">Se connecter</a></p></div>"#,
+        flash = flash(error, true),
+        domain = esc(domain),
+        name = esc(v.display_name),
+        email = esc(v.email),
+        loc = esc(v.location),
+    );
+    layout("Créer un compte", None, &body)
+}
+
+pub fn new_ticket_page(user: &User, error: Option<&str>) -> String {
     let body = format!(
         r#"{}
 <div class="card">
 <h1>Nouvelle demande informatique</h1>
-<p class="muted">Décrivez votre problème ou votre besoin. Un technicien prendra en charge votre demande
-et vous pourrez suivre son avancement grâce au lien fourni après l'envoi.</p>
+<p class="muted">Décrivez votre problème ou votre besoin. Un technicien prendra en charge votre demande ;
+vous la retrouverez dans <a href="/mes-demandes">Mes demandes</a>.</p>
 <form method="post" action="/tickets">
   <div class="row">
-    <div><label for="requester_name">Nom et prénom *</label>
-      <input type="text" id="requester_name" name="requester_name" required maxlength="100"></div>
-    <div><label for="requester_email">E-mail *</label>
-      <input type="email" id="requester_email" name="requester_email" required maxlength="150"></div>
+    <div><label>Demandeur</label>
+      <input type="text" value="{} ({})" disabled></div>
     <div><label for="requester_location">Service / Bureau</label>
-      <input type="text" id="requester_location" name="requester_location" maxlength="100"></div>
+      <input type="text" id="requester_location" name="requester_location" maxlength="100" value="{}"></div>
   </div>
   <div class="row">
     <div><label for="category">Catégorie *</label>
@@ -183,10 +240,52 @@ et vous pourrez suivre son avancement grâce au lien fourni après l'envoi.</p>
   <button type="submit">Envoyer la demande</button>
 </form></div>"#,
         flash(error, true),
+        esc(&user.display_name),
+        esc(&user.username),
+        esc(&user.location),
         options(CATEGORIES, ""),
         options(PRIORITIES, "normale"),
     );
-    layout("Nouvelle demande", None, &body)
+    layout("Nouvelle demande", Some(user), &body)
+}
+
+pub fn my_tickets_page(user: &User, tickets: &[Ticket]) -> String {
+    let rows: String = if tickets.is_empty() {
+        r#"<tr><td colspan="5" class="muted">Vous n'avez encore aucune demande.
+<a href="/">Créer une demande</a></td></tr>"#
+            .to_string()
+    } else {
+        tickets
+            .iter()
+            .map(|t| {
+                format!(
+                    r#"<tr><td>#{id}</td><td><a href="/suivi/{tok}">{title}</a></td><td>{status}</td>
+<td class="hide-sm">{assignee}</td><td class="hide-sm muted">{updated}</td></tr>"#,
+                    id = t.id,
+                    tok = t.token,
+                    title = esc(&t.title),
+                    status = status_badge(&t.status),
+                    assignee = t
+                        .assignee_name
+                        .as_deref()
+                        .map(esc)
+                        .unwrap_or_else(|| r#"<span class="muted">En attente d'attribution</span>"#.into()),
+                    updated = esc(&t.updated_at),
+                )
+            })
+            .collect()
+    };
+    let open = tickets.iter().filter(|t| t.status != "resolu" && t.status != "ferme").count();
+    let body = format!(
+        r#"<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px">
+<h1 style="margin:0">Mes demandes</h1><a class="btn" href="/">+ Nouvelle demande</a></div>
+<p class="muted">{open} demande(s) en cours sur {total}.</p>
+<div class="card" style="padding:0;overflow-x:auto">
+<table><thead><tr><th>N°</th><th>Objet</th><th>Statut</th><th class="hide-sm">Pris en charge par</th>
+<th class="hide-sm">Mis à jour</th></tr></thead><tbody>{rows}</tbody></table></div>"#,
+        total = tickets.len(),
+    );
+    layout("Mes demandes", Some(user), &body)
 }
 
 fn comments_html(comments: &[Comment]) -> String {
@@ -220,7 +319,13 @@ fn comments_html(comments: &[Comment]) -> String {
         .collect()
 }
 
-pub fn public_ticket_page(t: &Ticket, comments: &[Comment], base_url: &str, msg: Option<&str>) -> String {
+pub fn public_ticket_page(
+    viewer: Option<&User>,
+    t: &Ticket,
+    comments: &[Comment],
+    base_url: &str,
+    msg: Option<&str>,
+) -> String {
     let closed = t.status == "ferme";
     let reply_form = if closed {
         r#"<p class="muted">Ce ticket est fermé. Pour un nouveau problème, <a href="/">créez une nouvelle demande</a>.</p>"#
@@ -266,20 +371,21 @@ Si le problème persiste, répondez ci-dessus : le ticket sera rouvert. Sinon vo
         desc = text_block(&t.description),
         comments = comments_html(comments),
     );
-    layout(&format!("Ticket #{}", t.id), None, &body)
+    layout(&format!("Ticket #{}", t.id), viewer, &body)
 }
 
 pub fn login_page(error: Option<&str>) -> String {
     let body = format!(
         r#"<div class="card" style="max-width:420px;margin:40px auto">
-<h1>Espace technicien</h1>{}
+<h1>Connexion</h1>{}
 <form method="post" action="/login">
-  <label for="username">Identifiant</label>
+  <label for="username">E-mail (ou identifiant technicien)</label>
   <input type="text" id="username" name="username" required autofocus autocomplete="username">
   <label for="password">Mot de passe</label>
   <input type="password" id="password" name="password" required autocomplete="current-password">
   <p><button type="submit">Se connecter</button></p>
-</form></div>"#,
+</form>
+<p class="muted">Pas encore de compte ? <a href="/inscription">Créer un compte</a></p></div>"#,
         flash(error, true)
     );
     layout("Connexion", None, &body)
@@ -319,7 +425,7 @@ pub fn dashboard_page(
         let sel = if p.assigned == v { " selected" } else { "" };
         let _ = write!(assign_opts, r#"<option value="{v}"{sel}>{l}</option>"#);
     }
-    for u in users.iter().filter(|u| u.active) {
+    for u in users.iter().filter(|u| u.active && u.is_agent()) {
         let v = u.id.to_string();
         let sel = if p.assigned == v { " selected" } else { "" };
         let _ = write!(assign_opts, r#"<option value="{v}"{sel}>{}</option>"#, esc(&u.display_name));
@@ -384,7 +490,7 @@ pub fn agent_ticket_page(
     msg: Option<&str>,
 ) -> String {
     let mut assign_opts = String::from(r#"<option value="">— Non assigné —</option>"#);
-    for u in users.iter().filter(|u| u.active || Some(u.id) == t.assignee_id) {
+    for u in users.iter().filter(|u| u.is_agent() && (u.active || Some(u.id) == t.assignee_id)) {
         let sel = if Some(u.id) == t.assignee_id { " selected" } else { "" };
         let _ = write!(assign_opts, r#"<option value="{}"{sel}>{}</option>"#, u.id, esc(&u.display_name));
     }
@@ -489,7 +595,13 @@ pub fn users_page(user: &User, users: &[User], msg: Option<&str>, error: bool) -
 <button class="secondary" type="submit">Changer</button></form></td><td>{toggle}</td></tr>"#,
                 esc(&u.display_name),
                 esc(&u.username),
-                if u.is_admin { "Administrateur" } else { "Technicien" },
+                if !u.is_agent() {
+                    "Demandeur"
+                } else if u.is_admin {
+                    "Administrateur"
+                } else {
+                    "Technicien"
+                },
                 if u.active { "Actif" } else { "Désactivé" },
                 u.id,
             )
@@ -516,5 +628,5 @@ pub fn users_page(user: &User, users: &[User], msg: Option<&str>, error: bool) -
 </form></div>"#,
         flash = flash(msg, error),
     );
-    layout("Utilisateurs", Some(user), &body)
+    layout("Comptes", Some(user), &body)
 }

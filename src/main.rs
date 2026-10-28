@@ -14,13 +14,15 @@ use axum::{
 use rusqlite::Connection;
 use serde::Deserialize;
 
-use auth::{Admin, Agent};
+use auth::{Admin, Agent, MaybeUser, Requester};
 use db::{CATEGORIES, PRIORITIES, STATUSES};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
     pub base_url: Arc<String>,
+    /// Seules les adresses de ce domaine peuvent créer un compte demandeur.
+    pub allowed_domain: Arc<String>,
 }
 
 // ---------- Gestion des erreurs ----------
@@ -51,7 +53,7 @@ fn not_found() -> Response {
 /// Messages de confirmation passés en paramètre `?msg=` après une redirection.
 fn flash_message(code: Option<&str>) -> Option<&'static str> {
     match code? {
-        "cree" => Some("Votre demande a bien été enregistrée. Conservez le lien de suivi ci-dessous."),
+        "cree" => Some("Votre demande a bien été enregistrée. Vous la retrouverez dans « Mes demandes »."),
         "envoye" => Some("Message envoyé."),
         "maj" => Some("Ticket mis à jour."),
         "ferme" => Some("Ticket fermé. Merci !"),
@@ -72,14 +74,16 @@ fn clean(s: &str, max: usize) -> String {
 
 // ---------- Côté demandeur ----------
 
-async fn new_ticket_form() -> Html<String> {
-    Html(views::new_ticket_page(None))
+async fn home(State(st): State<AppState>, MaybeUser(user): MaybeUser) -> Response {
+    match user {
+        None => Html(views::home_page(&st.allowed_domain)).into_response(),
+        Some(u) if u.is_agent() => Redirect::to("/agent").into_response(),
+        Some(u) => Html(views::new_ticket_page(&u, None)).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
 struct NewTicketForm {
-    requester_name: String,
-    requester_email: String,
     #[serde(default)]
     requester_location: String,
     category: String,
@@ -88,27 +92,30 @@ struct NewTicketForm {
     description: String,
 }
 
-async fn create_ticket(State(st): State<AppState>, Form(f): Form<NewTicketForm>) -> AppResult<Response> {
+async fn create_ticket(
+    State(st): State<AppState>,
+    Requester(user): Requester,
+    Form(f): Form<NewTicketForm>,
+) -> AppResult<Response> {
     let t = db::NewTicket {
         title: clean(&f.title, 200),
         description: clean(&f.description, 10_000),
         category: f.category,
         priority: f.priority,
-        requester_name: clean(&f.requester_name, 100),
-        requester_email: clean(&f.requester_email, 150),
+        requester_name: user.display_name.clone(),
+        requester_email: user.username.clone(),
         requester_location: clean(&f.requester_location, 100),
+        requester_id: Some(user.id),
     };
-    let error = if t.title.is_empty() || t.description.is_empty() || t.requester_name.is_empty() {
+    let error = if t.title.is_empty() || t.description.is_empty() {
         Some("Merci de remplir tous les champs obligatoires.")
-    } else if !t.requester_email.contains('@') {
-        Some("Adresse e-mail invalide.")
     } else if !db::is_valid(CATEGORIES, &t.category) || !db::is_valid(PRIORITIES, &t.priority) {
         Some("Catégorie ou urgence invalide.")
     } else {
         None
     };
     if let Some(e) = error {
-        return Ok((StatusCode::BAD_REQUEST, Html(views::new_ticket_page(Some(e)))).into_response());
+        return Ok((StatusCode::BAD_REQUEST, Html(views::new_ticket_page(&user, Some(e)))).into_response());
     }
 
     let token = auth::random_token();
@@ -117,8 +124,84 @@ async fn create_ticket(State(st): State<AppState>, Form(f): Form<NewTicketForm>)
     Ok(Redirect::to(&format!("/suivi/{token}?msg=cree")).into_response())
 }
 
+async fn my_tickets(State(st): State<AppState>, Requester(user): Requester) -> AppResult<Html<String>> {
+    let tickets = db::tickets_for_requester(&st.db.lock().unwrap(), user.id)?;
+    Ok(Html(views::my_tickets_page(&user, &tickets)))
+}
+
+// ---------- Inscription des demandeurs ----------
+
+/// Vérifie que l'adresse est de la forme `quelquechose@<domaine autorisé>`.
+fn email_allowed(email: &str, domain: &str) -> bool {
+    match email.rsplit_once('@') {
+        Some((local, d)) => {
+            !local.is_empty()
+                && !local.contains('@')
+                && !email.contains(char::is_whitespace)
+                && d.eq_ignore_ascii_case(domain)
+        }
+        None => false,
+    }
+}
+
+async fn register_form(State(st): State<AppState>, MaybeUser(user): MaybeUser) -> Response {
+    if user.is_some() {
+        return Redirect::to("/").into_response();
+    }
+    let empty = views::RegisterValues { display_name: "", email: "", location: "" };
+    Html(views::register_page(&st.allowed_domain, &empty, None)).into_response()
+}
+
+#[derive(Deserialize)]
+struct RegisterForm {
+    display_name: String,
+    email: String,
+    #[serde(default)]
+    location: String,
+    password: String,
+    password2: String,
+}
+
+async fn register(State(st): State<AppState>, Form(f): Form<RegisterForm>) -> AppResult<Response> {
+    let display_name = clean(&f.display_name, 100);
+    let email = clean(&f.email, 150).to_lowercase();
+    let location = clean(&f.location, 100);
+    let domain = st.allowed_domain.as_str();
+
+    let error = if display_name.is_empty() {
+        Some("Merci d'indiquer votre nom.".to_string())
+    } else if !email_allowed(&email, domain) {
+        Some(format!("Seules les adresses @{domain} peuvent créer un compte."))
+    } else if f.password.chars().count() < 8 {
+        Some("Le mot de passe doit contenir au moins 8 caractères.".into())
+    } else if f.password != f.password2 {
+        Some("Les deux mots de passe ne correspondent pas.".into())
+    } else if db::username_exists(&st.db.lock().unwrap(), &email)? {
+        Some("Un compte existe déjà avec cette adresse. Connectez-vous.".into())
+    } else {
+        None
+    };
+    if let Some(e) = error {
+        let values = views::RegisterValues { display_name: &display_name, email: &email, location: &location };
+        let page = views::register_page(domain, &values, Some(&e));
+        return Ok((StatusCode::BAD_REQUEST, Html(page)).into_response());
+    }
+
+    let hash = auth::hash_password(&f.password);
+    let token = auth::random_token();
+    {
+        let conn = st.db.lock().unwrap();
+        let id = db::create_requester(&conn, &email, &display_name, &location, &hash)?;
+        db::link_tickets_by_email(&conn, id, &email)?;
+        db::create_session(&conn, &token, id)?;
+    }
+    println!("Nouveau compte demandeur : {email}");
+    Ok(([(header::SET_COOKIE, auth::session_cookie(&token))], Redirect::to("/mes-demandes")).into_response())
+}
+
 async fn public_ticket(
     State(st): State<AppState>,
+    MaybeUser(viewer): MaybeUser,
     Path(token): Path<String>,
     Query(q): Query<MsgQuery>,
 ) -> AppResult<Response> {
@@ -128,7 +211,8 @@ async fn public_ticket(
     };
     let comments = db::comments(&conn, t.id, false)?;
     let msg = flash_message(q.msg.as_deref());
-    Ok(Html(views::public_ticket_page(&t, &comments, &st.base_url, msg)).into_response())
+    let page = views::public_ticket_page(viewer.as_ref(), &t, &comments, &st.base_url, msg);
+    Ok(Html(page).into_response())
 }
 
 #[derive(Deserialize)]
@@ -172,8 +256,12 @@ async fn public_close(State(st): State<AppState>, Path(token): Path<String>) -> 
 
 // ---------- Authentification ----------
 
-async fn login_form() -> Html<String> {
-    Html(views::login_page(None))
+async fn login_form(MaybeUser(user): MaybeUser) -> Response {
+    match user {
+        Some(u) if u.is_agent() => Redirect::to("/agent").into_response(),
+        Some(_) => Redirect::to("/mes-demandes").into_response(),
+        None => Html(views::login_page(None)).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -190,8 +278,13 @@ async fn login(State(st): State<AppState>, Form(f): Form<LoginForm>) -> AppResul
         return Ok((StatusCode::UNAUTHORIZED, Html(page)).into_response());
     };
     let token = auth::random_token();
-    db::create_session(&st.db.lock().unwrap(), &token, user_id)?;
-    Ok(([(header::SET_COOKIE, auth::session_cookie(&token))], Redirect::to("/agent")).into_response())
+    let is_agent = {
+        let conn = st.db.lock().unwrap();
+        db::create_session(&conn, &token, user_id)?;
+        db::session_user(&conn, &token)?.is_some_and(|u| u.is_agent())
+    };
+    let target = if is_agent { "/agent" } else { "/mes-demandes" };
+    Ok(([(header::SET_COOKIE, auth::session_cookie(&token))], Redirect::to(target)).into_response())
 }
 
 async fn logout(State(st): State<AppState>, req: axum::extract::Request) -> AppResult<Response> {
@@ -401,7 +494,7 @@ async fn users_create(
         None => {
             let hash = auth::hash_password(&f.password);
             let conn = st.db.lock().unwrap();
-            match db::create_user(&conn, &username, &display_name, &hash, f.is_admin.is_some()) {
+            match db::create_agent(&conn, &username, &display_name, &hash, f.is_admin.is_some()) {
                 Ok(_) => None,
                 Err(rusqlite::Error::SqliteFailure(e, _))
                     if e.code == rusqlite::ErrorCode::ConstraintViolation =>
@@ -469,18 +562,20 @@ fn bootstrap_admin(conn: &Connection) -> rusqlite::Result<()> {
         Ok(p) if !p.is_empty() => (p, false),
         _ => (auth::random_token()[..16].to_string(), true),
     };
-    db::create_user(conn, "admin", "Administrateur", &auth::hash_password(&password), true)?;
+    db::create_agent(conn, "admin", "Administrateur", &auth::hash_password(&password), true)?;
     println!("Compte administrateur créé : identifiant « admin »");
     if generated {
-        println!("Mot de passe généré : {password}  (changez-le dans « Utilisateurs »)");
+        println!("Mot de passe généré : {password}  (changez-le dans « Comptes »)");
     }
     Ok(())
 }
 
 pub fn app(state: AppState) -> Router {
     Router::new()
-        .route("/", get(new_ticket_form))
+        .route("/", get(home))
         .route("/tickets", post(create_ticket))
+        .route("/mes-demandes", get(my_tickets))
+        .route("/inscription", get(register_form).post(register))
         .route("/suivi/{token}", get(public_ticket))
         .route("/suivi/{token}/commentaire", post(public_comment))
         .route("/suivi/{token}/fermer", post(public_close))
@@ -503,6 +598,7 @@ async fn main() {
     let db_path = env_or("TICKETING_DB", "tickets.db");
     let addr = env_or("TICKETING_ADDR", "0.0.0.0:8080");
     let base_url = env_or("TICKETING_BASE_URL", "http://localhost:8080");
+    let allowed_domain = env_or("TICKETING_ALLOWED_DOMAIN", "sias.fr").trim().trim_start_matches('@').to_lowercase();
 
     let conn = db::open(&db_path).expect("ouverture de la base de données impossible");
     bootstrap_admin(&conn).expect("création du compte administrateur impossible");
@@ -510,11 +606,12 @@ async fn main() {
     let state = AppState {
         db: Arc::new(Mutex::new(conn)),
         base_url: Arc::new(base_url.trim_end_matches('/').to_string()),
+        allowed_domain: Arc::new(allowed_domain),
     };
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("impossible d'écouter sur {addr} : {e}"));
-    println!("Support IT démarré sur http://{addr} (base : {db_path})");
+    println!("Support IT démarré sur http://{addr} (base : {db_path}, inscriptions : @{})", state.allowed_domain);
     axum::serve(listener, app(state)).await.unwrap();
 }

@@ -63,12 +63,24 @@ pub struct Comment {
     pub created_at: String,
 }
 
+pub const ROLE_AGENT: &str = "agent";
+pub const ROLE_REQUESTER: &str = "demandeur";
+
 pub struct User {
     pub id: i64,
+    /// Identifiant de connexion : nom court pour un technicien, e-mail pour un demandeur.
     pub username: String,
     pub display_name: String,
     pub is_admin: bool,
     pub active: bool,
+    pub role: String,
+    pub location: String,
+}
+
+impl User {
+    pub fn is_agent(&self) -> bool {
+        self.role == ROLE_AGENT
+    }
 }
 
 pub struct NewTicket {
@@ -79,6 +91,7 @@ pub struct NewTicket {
     pub requester_name: String,
     pub requester_email: String,
     pub requester_location: String,
+    pub requester_id: Option<i64>,
 }
 
 #[derive(Default)]
@@ -103,7 +116,9 @@ pub fn open(path: &str) -> Result<Connection> {
              display_name  TEXT NOT NULL,
              password_hash TEXT NOT NULL,
              is_admin      INTEGER NOT NULL DEFAULT 0,
-             active        INTEGER NOT NULL DEFAULT 1
+             active        INTEGER NOT NULL DEFAULT 1,
+             role          TEXT NOT NULL DEFAULT 'agent',
+             location      TEXT NOT NULL DEFAULT ''
          );
 
          CREATE TABLE IF NOT EXISTS sessions (
@@ -124,6 +139,7 @@ pub fn open(path: &str) -> Result<Connection> {
              requester_email    TEXT NOT NULL,
              requester_location TEXT NOT NULL DEFAULT '',
              assignee_id        INTEGER REFERENCES users(id),
+             requester_id       INTEGER REFERENCES users(id),
              created_at         TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
              updated_at         TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
          );
@@ -141,7 +157,29 @@ pub fn open(path: &str) -> Result<Connection> {
          CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
          CREATE INDEX IF NOT EXISTS idx_comments_ticket ON comments(ticket_id);",
     )?;
+    migrate(&conn)?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_tickets_requester ON tickets(requester_id);")?;
     Ok(conn)
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names: Vec<String> = stmt.query_map([], |r| r.get(1))?.collect::<Result<_>>()?;
+    Ok(names.iter().any(|n| n == column))
+}
+
+/// Mise à niveau des bases créées par une version précédente.
+fn migrate(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "users", "role")? {
+        conn.execute_batch(
+            "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'agent';
+             ALTER TABLE users ADD COLUMN location TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    if !has_column(conn, "tickets", "requester_id")? {
+        conn.execute_batch("ALTER TABLE tickets ADD COLUMN requester_id INTEGER REFERENCES users(id);")?;
+    }
+    Ok(())
 }
 
 // ---------- Utilisateurs (techniciens) ----------
@@ -150,7 +188,7 @@ pub fn count_users(conn: &Connection) -> Result<i64> {
     conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
 }
 
-pub fn create_user(
+pub fn create_agent(
     conn: &Connection,
     username: &str,
     display_name: &str,
@@ -158,15 +196,37 @@ pub fn create_user(
     is_admin: bool,
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO users (username, display_name, password_hash, is_admin) VALUES (?1, ?2, ?3, ?4)",
-        params![username, display_name, password_hash, is_admin],
+        "INSERT INTO users (username, display_name, password_hash, is_admin, role) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![username, display_name, password_hash, is_admin, ROLE_AGENT],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
+pub fn create_requester(
+    conn: &Connection,
+    email: &str,
+    display_name: &str,
+    location: &str,
+    password_hash: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO users (username, display_name, password_hash, role, location) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![email, display_name, password_hash, ROLE_REQUESTER, location],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn username_exists(conn: &Connection, username: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE lower(username) = lower(?1))",
+        [username],
+        |r| r.get(0),
+    )
+}
+
 pub fn user_credentials(conn: &Connection, username: &str) -> Result<Option<(i64, String)>> {
     conn.query_row(
-        "SELECT id, password_hash FROM users WHERE username = ?1 AND active = 1",
+        "SELECT id, password_hash FROM users WHERE lower(username) = lower(?1) AND active = 1",
         [username],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )
@@ -180,12 +240,15 @@ fn row_to_user(r: &rusqlite::Row) -> Result<User> {
         display_name: r.get(2)?,
         is_admin: r.get(3)?,
         active: r.get(4)?,
+        role: r.get(5)?,
+        location: r.get(6)?,
     })
 }
 
 pub fn list_users(conn: &Connection) -> Result<Vec<User>> {
     let mut stmt = conn.prepare(
-        "SELECT id, username, display_name, is_admin, active FROM users ORDER BY display_name",
+        "SELECT id, username, display_name, is_admin, active, role, location FROM users
+         ORDER BY role, display_name",
     )?;
     stmt.query_map([], row_to_user)?.collect()
 }
@@ -219,7 +282,7 @@ pub fn create_session(conn: &Connection, token: &str, user_id: i64) -> Result<()
 
 pub fn session_user(conn: &Connection, token: &str) -> Result<Option<User>> {
     conn.query_row(
-        "SELECT u.id, u.username, u.display_name, u.is_admin, u.active
+        "SELECT u.id, u.username, u.display_name, u.is_admin, u.active, u.role, u.location
          FROM sessions s JOIN users u ON u.id = s.user_id
          WHERE s.token = ?1 AND s.expires_at > datetime('now') AND u.active = 1",
         [token],
@@ -262,8 +325,8 @@ fn row_to_ticket(r: &rusqlite::Row) -> Result<Ticket> {
 pub fn create_ticket(conn: &Connection, t: &NewTicket, token: &str) -> Result<i64> {
     conn.execute(
         "INSERT INTO tickets (token, title, description, category, priority,
-                              requester_name, requester_email, requester_location)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                              requester_name, requester_email, requester_location, requester_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             token,
             t.title,
@@ -272,7 +335,8 @@ pub fn create_ticket(conn: &Connection, t: &NewTicket, token: &str) -> Result<i6
             t.priority,
             t.requester_name,
             t.requester_email,
-            t.requester_location
+            t.requester_location,
+            t.requester_id
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -322,6 +386,22 @@ pub fn list_tickets(conn: &Connection, f: &TicketFilter) -> Result<Vec<Ticket>> 
     let mut stmt = conn.prepare(&sql)?;
     let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
     stmt.query_map(refs.as_slice(), row_to_ticket)?.collect()
+}
+
+pub fn tickets_for_requester(conn: &Connection, user_id: i64) -> Result<Vec<Ticket>> {
+    let mut stmt = conn.prepare(&format!(
+        "{TICKET_SELECT} WHERE t.requester_id = ?1
+         ORDER BY t.status IN ('resolu', 'ferme'), t.updated_at DESC"
+    ))?;
+    stmt.query_map([user_id], row_to_ticket)?.collect()
+}
+
+/// Rattache au compte les tickets envoyés auparavant avec la même adresse.
+pub fn link_tickets_by_email(conn: &Connection, user_id: i64, email: &str) -> Result<usize> {
+    conn.execute(
+        "UPDATE tickets SET requester_id = ?1 WHERE requester_id IS NULL AND lower(requester_email) = lower(?2)",
+        params![user_id, email],
+    )
 }
 
 pub fn status_counts(conn: &Connection) -> Result<Vec<(String, i64)>> {
